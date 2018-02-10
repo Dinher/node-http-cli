@@ -1,0 +1,15 @@
+{
+  "name": "httpc",
+  "version": "1.0.0",
+  "description": "Comp 445 - Assignment 1: A cURL project http CLI",
+  "main": "./lib/httpc.js",
+  "bin": {
+    "httpc": "bin/httpc.js"
+  },
+  "author": "Nguyen Dinh",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^2.3.0",
+    "commander": "^2.13.0"
+  }
+}

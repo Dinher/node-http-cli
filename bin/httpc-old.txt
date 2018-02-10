@@ -1,0 +1,505 @@
+#!/usr/bin/env node
+'use strict'
+
+// Modules
+const http = require('http');
+const net = require('net');
+const chalk = require('chalk');
+const display = require('../lib/display-messages');    //displays help messages
+const commander = require('commander');
+const log = console.log;  
+
+// Global Variables
+var redirectLocation = "";
+var redirectFlag = false;
+var clientContentBodyFlag = false;
+var numRedirects = 0;
+var verbose = false;
+/*
+// not in use
+let postAction = () =>{
+  log('start postaction\n');
+  log('\nend postAction\n');
+}
+
+// not in use
+function sendRequest(options,output){ 
+    const postData = "hello world";
+    const req = http.request(options, (res) => {
+    log(`STATUS: ${res.statusCode}`);
+    log(`HEADERS: ${JSON.stringify(res.headers)}`);
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => {
+      log(`BODY: ${chunk}`);
+    });
+    res.on('end', () => {
+      log('No more data in response.');
+    });
+  });
+
+  req.on('error', (e) => {
+    console.error(`problem with request: ${e.message}`);
+  });
+  req.write(postData);
+  req.end();
+}
+
+// not in use
+function buildRequest(output,requestType){
+  var splitURL;
+  if(output.url.search("//") == -1){
+    splitURL = output.url.split("/");  
+  }else{
+    var removeProtocol = output.url.split("http://");
+    splitURL = removeProtocol[1].split("/");  
+  }
+  const options = {
+    hostname: splitURL[0],
+    port: 80,
+    //headers: output.headers,
+    method: requestType,
+  }
+  if(splitURL[1]){
+    options["path"] = "/"+splitURL[1];
+  }
+  log(JSON.stringify(options,null,2));
+  return options;
+}
+*/
+
+
+// from socket connection
+function parseServerResponse(data){
+  // separates data into individual lines
+  let responseSplit = data.split('\r\n\r\n');
+  let responseHeaders = responseSplit[0];
+  let responseBody = responseSplit[1];
+  
+  responseHeaders = responseHeaders.split("\r\n");
+  
+  // parses out HTTP response code
+  let httpResponse = responseHeaders[0].split(" ");
+  log(chalk.grey("Response Status"))
+  log(
+    chalk.blue("Protocol: ")+httpResponse[0]+
+    chalk.blue("\nStatus Code: ")+httpResponse[1]+
+    chalk.blue("\nStatus: ")+httpResponse[2]
+  );
+  
+  // Parses response headers
+  let attributes = {};    
+  for(let i = 1; i < responseHeaders.length; i++){
+      let temp = responseHeaders[i].split(/:(.+)/);
+      attributes[temp[0]] = temp[1];      
+  }
+  log(chalk.grey("\nResponse Header Attributes"));
+  var lineCount = 1;
+  for(let key in attributes){
+    if(key != null && attributes[key] != null){
+      log(chalk.blue(chalk.grey(lineCount)+" "+key+": ")+attributes[key]);
+      lineCount++;
+    }
+  }
+  // determines size of response body - does it match with header information??
+  // also body is cut off if this isn't done....
+  let bodyLength = 0;
+  try{
+    bodyLength = new Buffer(responseBody).length;
+  }catch(err){
+    log(chalk.red(err));
+    return 0;
+  }
+  log(chalk.grey("\nResponse Body\n")+chalk.blue("Body-Length: ")+bodyLength);
+  log(chalk.cyan(responseBody));
+}
+
+// checks for 3xx codes
+function checkRedirect(data,host){
+  let dataSplit = data.split('\r\n');
+  // First line of response had status code
+  let requestStatus = dataSplit[0].split(" ");
+  if(requestStatus[1][0] == "3") {
+    log(chalk.yellow('\n[Redirect Status '+ chalk.green(requestStatus[1]) +' Detected]'));
+    
+    // Determine redirect location
+    for(let i = 0; i <dataSplit.length; i++){
+      if(dataSplit[i].search("Location") > -1){
+        let location = dataSplit[i].split(/: (.+)/);
+        log(chalk.blue("Redirect Location: ")+location[1]);
+        
+        // If redirect location is relative
+        if(location[1][0] == "/" ){
+          redirectLocation = host+location[1];
+        }else{
+          redirectLocation = location[1];
+        }
+        
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// returns JSON with the parsed URL
+function parseURL(URL){
+  log(chalk.yellow("[Parsing URL]"));
+  log(chalk.green(URL))
+  let urlDescription = {};
+  // determines port number and removes protocol
+  if(URL.search("https://") > -1){
+    urlDescription["port"] = 443;
+    URL = URL.substr(8);
+  }else{
+    urlDescription["port"] = 80;
+    if(URL.search("http://") > -1){
+      URL = URL.substr(7);
+    }
+  }
+  
+  //removes www
+  if(URL.search("www.") > -1){
+    URL = URL.substr(4);
+  }
+  
+  // parses host and request
+  let host = URL.split(/\/(.+)/);
+  if(host[1] === undefined){
+    host[1] = "";
+    if(host[0].search("/") > -1){
+      host[0] = host[0].slice(0,-1);
+    }
+  }
+  urlDescription["host"] = host[0];
+  urlDescription["path"] = "/"+host[1];
+  
+  // parses URL query
+  urlDescription["args"] = {}
+  if(URL.search("\\?") > -1){
+    let urlArgs = URL.split("?");
+    if(urlArgs[1].search("&") > -1){
+      urlArgs = urlArgs[1].split("&");
+      for(let i = 0; i < urlArgs.length; i++){
+        let temp = urlArgs[i].split("=");
+        urlDescription.args[temp[0]] = temp[1];
+      }
+    }
+  }
+  
+  log(chalk.blue(JSON.stringify(urlDescription,null,2)));
+  return urlDescription;
+}
+
+// Polyfill for replace all method
+String.prototype.replaceAll = function(target, replacement){
+  return this.split(target).join(replacement);
+}
+
+/*
+** Net/Socket
+*/
+// custom socket connection, httpc test "www.site.com"
+function establishConnection(input){
+  let _URL = parseURL(input[0]);
+  let _reqMethod = input[1]._name.toUpperCase();
+  let _protocol = "HTTP/1.1";
+  let _header = input[1].header;
+  
+  //log("REQUEST: "+ _reqMethod + " " + _URL.path +" " + _protocol);
+  
+  var socket = new net.Socket();
+  var host = _URL.host;
+  var port = _URL.port;
+  var requestBody = ""
+  var responseData = "";
+  var numPackets = 1;
+  var clientInfo;
+  
+  let httpRequest = "";
+  
+  // User has data
+  if(input[1].inlineData !== undefined){
+    requestBody = input[1].inlineData;
+    _URL["Content-Length"] = new Buffer(requestBody).length;
+    clientContentBodyFlag = true;
+  }
+  
+  // Builds Request
+  httpRequest += _reqMethod + " " + _URL.path + " " + _protocol + "\r\n";
+  httpRequest += "Host:"+_URL.host+"\r\n";  // required for most sites
+  if (_header.length > 0){
+    for( let i = 0; i < _header.length; i++ ){
+      httpRequest += _header[i]+"\r\n";
+    }
+  }
+  if(clientContentBodyFlag){
+    httpRequest += "Content-Length: "+_URL["Content-Length"]+"\r\n";
+    clientContentBodyFlag = false;
+  }
+  
+  httpRequest += "\r\n"+requestBody;
+  
+  log(chalk.yellow("\n[Beginning TCP connection]"));
+  
+  // Create a TCP connction 
+  socket.connect(port,host);
+  
+  // Listens for successful connection
+  socket.on('connect',function(){
+    log(chalk.green('\nSocket connection established'));
+    
+    //var HTTPRequest = "GET /status/302 HTTP/1.1\r\n\Host:"+host+"\r\n\r\n";
+    
+    // Send client data to user
+    log(chalk.yellow("\n[Preparing Client Request]"))
+    log(chalk.grey("Raw HTTP Request:"))
+    log(chalk.white(httpRequest)+"\n");
+    socket.write(httpRequest,function(){
+      log(chalk.yellow("[Request Sent]\n"));
+    }); 
+    
+    // Closes connection
+    socket.end();
+  })
+  
+  // Listens for server data
+  socket.on('data', function(data){
+    log(chalk.green("Server Response:"+chalk.grey("\tPacket ")+"["+chalk.white(numPackets++)+"]"+chalk.grey(" Recieved")));
+    
+    // If data is large it gets chunked, parse data after all received data
+    redirectFlag = checkRedirect(data.toString(),host);
+    responseData += data;
+    clientInfo = this.address();
+  });
+  
+  // Listens for successful host lookup
+  socket.on('lookup',function(err,address,family,host){
+    if(!err){
+     log(chalk.green("Host Lookup Successful")+
+         chalk.blue("\nHost: ")+host+
+         chalk.blue("\nFamliy: ")+family+
+         chalk.blue("\nIP Address: ")+address);
+    }else{
+      log(chalk.red("Error: "+err));
+      return 0;
+    }
+  })
+  
+  // Listens connection errors
+  socket.on('error',function(err){
+    log(chalk.red(err));
+    return 0;
+  });
+  
+  // Listens closed connection
+  socket.on('close',function(){
+    // Parse server data
+    log(chalk.yellow("\n[Parsing Received Data]"));
+    parseServerResponse(responseData.toString());
+    //log(data.toString().replaceAll("><",">\n<"));
+    //log(data.toString())
+    log(chalk.grey("\nClient information: \n")+chalk.cyan(JSON.stringify(clientInfo,null,2)));
+    log(chalk.yellow('\n[TCP connection closed]\n'));
+    log(chalk.red("Number of Redirects ")+"["+numRedirects+']');
+    if(redirectFlag){
+      redirectFlag = false;
+      numRedirects++;
+      log(chalk.yellow("[Redirecting to new URL]\n")+chalk.cyan(redirectLocation)+"\n");
+      input[0] = redirectLocation;
+      establishConnection(input);
+    }
+  })
+}
+
+/*
+** COMMANDER
+*/
+commander
+  .command('get')     // originally POST
+  .description('HTTP Get Request')
+  .option('-v, --verbose [boolean]','Verbose - decriptive logging')
+  .option('-h, --header [header...]','Add a header attribute', function(attributes,headerArgs){
+    headerArgs.push(attributes);
+    return headerArgs;
+  },[])
+  .option('-d, --inline-data [inline-data]','Add inline data for request body')
+  .option('-f, --file [file]','Attatch file to Request')
+  //.option('<URL>')
+  //.action(postAction);
+  .action(function(URL,option){
+    //log('Request Method: '+option._name);
+    //log('URL: '+URL);
+    //if(option.verbose)log('Verbose: '+option.verbose);
+    //if(option.header)log('Header: '+option.header);
+    //if(option.inlineData)log('Data: '+option.inlineData);
+    //if(option.file)log('File: '+option.file);
+  });
+  
+commander
+  .command('post')     
+  .description('HTTP Post Request')
+  .option('-v, --verbose [boolean]','Verbose - descriptive loggin')
+  .option('-h, --header [header...]','Add a request header attribute', function(attributes,headerArgs){
+    headerArgs.push(attributes);
+    return headerArgs;
+  },[])
+  .option('-d, --inline-data [inline-data]','Add inline data for request body')
+  .option('-f, --file [file]','Attach file to request')
+  //.option('<URL>')
+  //.action(postAction);
+  .action(function(URL,option){
+  /*
+    log('Request Method: '+option._name);
+    log('URL: '+URL);
+    if(option.verbose)log('Verbose: '+option.verbose);
+    if(option.header)log('Header: '+option.header);
+    if(option.inlineData)log('Data: '+option.inlineData);
+    if(option.file)log('File: '+option.file);
+  */
+  });
+
+// Help Command
+commander
+  .command('help')
+  .option('get', "Program Help Assistant")
+  .option('post', "Program Help Assistant")
+
+commander.parse(process.argv);
+
+//display help if empty arguments
+if (commander.args.length === 0) {
+  commander.help();
+  return 0;
+}
+
+var input = commander.args;
+
+// Detects help command
+if(input[0] == "help"){
+  if(input[1] == "get"){
+    display.get();
+  }else if(input[1] == "post"){
+    display.post();
+  }else{
+    display.info();
+  }
+  return 0;
+}else if(input[1]){
+  if(input[1]._name == "get" || input[1]._name== "post"){
+    display.splash();
+    establishConnection(input);
+  }
+}else{
+  log(chalk.red("\nInput Error"))
+  display.info();
+}
+
+
+
+//postAction();
+
+/*
+let createRequest = () =>{
+  log(chalk.yellow("Building HTTP request\n"));
+  //log(input);
+  
+  // output JSON object
+  var output = {
+    "args": {},
+    "data": {},
+    "files": {},
+    "headers": {},
+    "url": ""
+  }
+  
+  // get URL
+  output["url"] = input[0];
+  
+  // parse URL queries
+  urlQuery(input[0],output);
+  
+  // sets headers
+  getHeaders(input[1].header, output);
+  
+
+  if(input[1].inlineData && input[1].file){
+    header += "\r\nBOTH INLINE AND FILE DATA"; 
+  }else if(input[1].inlineData){
+    header += "\r\nData:"+input[1].inlineData;
+  }else if(input[1].file){
+    header += "\r\nFile:"+input[1].file;
+  }
+  var endHeader = "\r\n\r\n";
+  //var body = "BODY";
+  //var fullRequest = method + header + endHeader + body;
+  //log(fullRequest);
+  
+  log("Output:\n");
+  if(input[1].verbose){
+    // display method and url
+    //log(input[1]._name.toUpperCase() + " " + input[0] +" HTTP/1.1");
+    var requestType = input[1]._name+"\n";
+    var httpVersion = "HTTP /" + "1.1";
+    var serverResponseCode = " 200";
+    var serverResponse = " OK";
+    var serverType = "\nServer: " + "nginx";
+    var serverDate = "\nDate: " + Date.now();
+    var contentType = "\nContent-Type: " + "application/json";
+    var contentLenth = "\nContent-Length: " + "255";
+    var connection = "\nConnection: " + "open";
+    var accessControl_Origin = "\nAccess-Control-Allow-Origin: " + "*";
+    var accessControl_Credentials = "\nAccess-Control-Allow-Credentials: " + "true";
+  
+    var verbose = requestType+
+              httpVersion+
+              serverResponseCode+
+              serverResponse+
+              serverType+
+              serverDate+
+              contentType+
+              contentLenth+
+              connection+
+              accessControl_Origin+
+              accessControl_Credentials;
+    
+    log(verbose);
+  }
+  log("\n"+JSON.stringify(output,null,2));
+  sendRequest(buildRequest(output, input[1]._name),output);
+}
+
+function urlQuery(url,output){
+  var query = url.split("?");
+  if(query[1]){
+    var values = query[1].split("&");
+    for(var i = 0; i < values.length;i++){
+      var attributes = values[i].split("=");
+      output.args[attributes[0]] = attributes[1];
+    }
+    //log(JSON.stringify(output.args,null,2));    
+  }
+}
+
+function getHeaders(input, output){
+  for(var attribute in input){
+    var attr = input[attribute].split("=");
+    output.headers[attr[0]] = attr[1];
+  }
+}
+
+//createRequest();
+
+
+/*
+can't use both -d and -f
+can't use -d or -f with get
+headers may have attributes
+  attribute:value
+  
+//bonus
+- add redirect specifications
+  - ie. client redirects when code is given
+
+- add write to file option
+  '-o file.txt'
+*/
